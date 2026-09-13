@@ -1,0 +1,30 @@
+I'll start by following the repo's mandatory session protocol, then dig into the audit.I need shell access for `date`/`git`, but it's blocked in this session. Let me append the session log and read the code files directly.I've completed the re-audit by reading all five code files, `output.csv`, and cross-referencing against `financial_events.csv`, `messages.csv`, `financial_profiles.csv`, `requests.csv`, and `exchange_rates.csv`. Note: this session is read-only (shell and file-write are blocked), so I could not re-run the pipeline or append to `log.txt` — this is static analysis plus direct data cross-checking.
+
+## What's verified working
+
+**All six Round 2 fixes are correctly implemented:**
+
+1. **Salary whitelist is complete and correct.** I enumerated every `salary`-category credit description in the dataset. The recurring set — `Payroll credit`, `Base salary`, `International employer payroll`, `Primary household salary`, `First-job payroll`, `New employer payroll`, `Payroll after returning from leave`, `Prorated first salary`, `Next confirmed salary`, `Second household income` — is fully covered by `RECURRING_SALARY_DESCRIPTIONS`. The freelance/irregular types (`Consulting/Content/Independent/Client retainer/Design contract`, `Freelance milestone`, `Application/Website project payment`) are correctly excluded. No bonus/commission/arrears/reimbursement events exist in the `salary` category.
+
+2. **No-phantom-salary fallback is fixed.** When `valid_sals` is empty, `salary_streams` stays `[]` (the old fallback-to-last-irregular-salary path is gone). I confirmed freelance users (e.g. `user_30`) now yield `not_affordable` with no spurious future income.
+
+3. **Dual-income works.** `user_13`, `user_258`, `user_270` are the only dual-income households, and none have salary-revision messages, so the two-stream path triggers cleanly (primary day 15 + second day 20). `request_258` (affordable_now) and `request_270` (not_affordable) are both correct — `request_270` fails only because the user allows `installments` only and both options (18/24 payments) exceed `max_installment_months=7`.
+
+4. **`final employer payroll` detection works.** `user_05`'s last salary event is `Final employer payroll` → `sal_ended=True`, correctly suppressing phantom recurring `Payroll credit`.
+
+5. **`[\s\S]*?` fix works.** The partial-household-employment regex now crosses sentence periods; all 7 such messages (users 42, 50, 58, 154, 230, 238, 262) extract the retained salary correctly.
+
+6. **Formatting/precision/clamping verified.** `fmt_amount` strips `.00`; partial-payment pairs sum exactly (e.g. `38946.82 + 10503.18 = 49450.00`); `calendar.monthrange` clamps day 29/30/31.
+
+**Output integrity:** 250 rows (`request_26`–`request_275`), exact 8-column order, consistent `earliest_date` values, and mtime shows `output.csv` was regenerated after the Round 2 reviews.
+
+## Remaining concerns (all minor/latent, none blocking)
+
+- **`temporary monthly pay is X` (English) is not captured** by the `m_sal` regex, whose keywords are `salary|payroll|gaji|wage` — "pay" alone isn't matched. I verified this is *benign* here because the event data already reflects the reduction before the message is sent (users 06, 103, 130, 175, 193, 220, 247), but it's a latent robustness gap.
+- **`evaluate_spending_changes` uses a greedy `savings >= shortfall` check** without re-simulating daily balances; it could theoretically mis-cover timing edge cases, though all three sample spending-change cases match.
+- **`get_exchange_rate` "closest date" fallback takes the latest rate**, not the true nearest — benign because every pair's rate is constant in this dataset.
+- **Second-income uses `mean()`**, which can overstate a declining stream (e.g. `user_270`'s second income stops after May). Benign for outcomes here, but a mild non-conservative choice.
+
+## Verdict
+
+**APPROVED / SUCCESS.** All six claimed fixes are correct, the salary model now cleanly separates recurring from irregular income, dual-income and termination edge cases are handled, and `output.csv` is well-formed and consistent with the current code. The remaining items are low-priority latent concerns, not defects in the current dataset. If I had shell access I'd still recommend one final `python3 code/main.py` regeneration + a sample-accuracy re-run to confirm byte-for-byte, since I could not execute anything in this read-only session.

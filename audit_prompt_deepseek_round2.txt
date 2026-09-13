@@ -1,0 +1,11 @@
+You reviewed the Buy or Wait codebase and identified key issues:
+1. Partial-payment plan amounts precision: Fixed in `code/planner.py` and `code/main.py`. Now `amount_safe_to_pay` and the first payment amount match exactly character-for-character as clean strings, and both payments sum to `requested_amount` with zero floating point precision junk.
+2. Partial household employment ended: Fixed in `code/messages_parser.py`. Users 42, 50, 58, 154, 230, 238, and 262 now properly retain their remaining confirmed salary (in both English and Indonesian), and `salary_ended=False`.
+3. Integer formatting in payment plans: Fixed in `code/planner.py`. No trailing `.00` on integer amounts across all candidate payment plans.
+4. Month-end date clamping: Fixed in `code/forecast_engine.py` using `calendar.monthrange(year, month)[1]`.
+5. Irregular salary filtering: One-off bonuses, arrears, and performance commissions are excluded from base recurring monthly salary.
+6. Spending changes: Protected categories are strictly excluded from spending adjustments.
+7. `output.csv` has been regenerated across all 250 evaluation requests.
+
+Please re-audit the updated files: `code/planner.py`, `code/messages_parser.py`, `code/forecast_engine.py`, `code/main.py`, and `output.csv`.
+Are all your findings resolved? Does the solution pass your verification? Please provide your verdict (SUCCESS / APPROVED or any remaining issues).

@@ -1,0 +1,19 @@
+You are acting as an expert adversarial code reviewer and financial auditor for the HackerRank Orchestrate "Buy or Wait?" challenge.
+
+Carefully inspect the implementation files in this repository:
+1. `code/data_loader.py`: Ingestion, currency normalization via `exchange_rates.csv`, OCR data mapping from 16 receipt images.
+2. `code/messages_parser.py`: Parsing 215 unstructured messages for salary adjustments, payday schedule shifts, rent percentage changes, and filtering prompt injection scams.
+3. `code/forecast_engine.py`: 90-day continuous daily cash-flow trajectory B(t), pending debits reservation, confirmed salary, fixed recurring commitments, essential variable spend (groceries/transport), and strict minimum_balance_to_keep preservation.
+4. `code/planner.py`: Multi-candidate ranking and tie-breaking hierarchy (completes on time -> no spending changes -> min total payable -> earlier start -> fewer payments -> option ID).
+5. `code/explainer.py`: Grounded natural language explanation generator matching benchmark sample formatting.
+6. `code/main.py`: Full evaluation runner generating `output.csv`.
+7. `output.csv`: The final predictions for 250 evaluation requests.
+8. `test_full_sample_benchmark.py`: Validation against the 25 ground-truth samples in `dataset/sample_requests.csv`.
+
+Perform a thorough, critical audit of:
+- Edge cases in the 90-day cash flow simulation (e.g. date clamping at month ends like Feb 28, leap years, pending debit handling, cash vs unrealized investments).
+- Tie-breaking rules and constraints (e.g. partial payments, installment restrictions such as max_installment_months, user payment preferences).
+- Spending change evaluation (flexible categories, minimum_allowed_amount, formatting syntax).
+- Format and schema compliance of output.csv against problem_statement.md and AGENTS.md.
+
+List all potential issues, vulnerabilities, or improvements you identify, categorized by severity (Critical, Moderate, Minor / Edge-case), and suggest concrete fixes.

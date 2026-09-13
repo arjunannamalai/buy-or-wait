@@ -1,0 +1,23 @@
+I'll start by following the AGENTS.md protocol — checking the log file and current repo state, then auditing the files.Shell commands and file writes appear restricted in this session. I'll focus on the read-only audit, which is the core task. Let me read the updated files in parallel.Now let me read the supporting modules and the output file to verify the fixes are correctly wired through.Let me verify the data-level fixes by examining the actual messages and events for the affected users.Let me check the test files and verify scripts to see what's actually being validated, and examine the financial events for the irregular-salary edge case.Let me examine the financial events schema and check the irregular-salary edge case I'm concerned about.This is a significant finding. Let me examine the requests files and sample answers to determine the impact of the irregular-salary filtering edge case.Let me verify whether the gig/freelance users in the evaluation set actually have only irregular salary events (which would expose the filtering bug).I've completed a static re-audit of all five files plus `output.csv`, cross-referencing against the raw dataset. Note: this session is read-only (shell/file-write blocked), so I verified by reading the code and data directly rather than re-running the pipeline.
+
+## Verdict: NOT APPROVED — two real issues remain, plus a latent one
+
+**Verified fixed (correct):**
+- **#1 Partial-payment precision** — `fmt_amount` is applied consistently in `planner.py` and `main.py`. I spot-checked all 11 partial-payment rows (e.g. `request_46`: `38946.82 + 10503.18 = 49450.00`); `amount_safe_to_pay` matches the first plan payment character-for-character and both sum to `requested_amount`.
+- **#3 Integer formatting** — `fmt_amount` strips `.00`; confirmed no trailing decimals on whole-amount plans.
+- **#4 Month-end clamping** — `calendar.monthrange(...)[1]` is used in salary, fixed-item, and weekly-spend projection loops.
+- **#6 Protected spending** — `stop_cats`/`red_cats` are correctly reduced by `prot_cats` before candidate generation.
+- **#7 Output** — 250 rows, correct 8-column order.
+
+**Functionally OK but fragile (⚠️):**
+- **#2 Partial household employment** — the *output* is correct for all 7 users (`salary_ended=False`, correct retained salary). But the intended regex is actually broken: the `[^\.\n]*?` between `"has ended"` and `"remaining confirmed monthly salary"` cannot cross the period in `"...has ended. The remaining confirmed..."`. It works only because the generic salary regex (`#3`) happens to capture the same figure as a fallback. Worth fixing for robustness.
+
+**Remaining issues (❌):**
+
+- **#5 Irregular-salary filtering is incomplete.** `IRREGULAR_SALARY_KEYWORDS` catches `commission/bonus/arrears/freelance milestone/project payment`, but the dataset has five more recurring-irregular types that are NOT filtered: `Consulting invoice payment`, `Content contract payment`, `Independent work payment`, `Client retainer payment`, `Design contract payment`. Gig/contract users (e.g. `user_26`, `user_30`, `user_66`, `user_90`, `user_102` — all in the evaluation set) get a phantom monthly salary projected from their last invoice, **overstating** affordability.
+
+- **Dual-income collapse is still unaddressed.** Users with `Primary household salary` (fixed, day 15) **plus** `Second household income` (variable, day 20) have only the single most-recent event kept. For `user_258`/`user_270` (evaluation) this **understates** income. Example: `request_270` outputs `not_affordable` for a USD 3,028 request despite ~USD 1,700/mo of confirmed income, because one stream is dropped.
+
+- **Minor bug in the filter itself:** when *all* of a user's salary events match the keywords, `valid_sals` is empty, the `if valid_sals:` reassignment is skipped, and the code falls through to use the last irregular salary anyway.
+
+The core salary-modeling problem from the earlier Claude/DeepSeek audit — separate recurring base salary from one-time/irregular credits, and sum distinct recurring streams — is only half-solved. I'd fix the keyword list (or better, whitelist recurring descriptions like `Base salary`/`Primary household salary`) and handle dual streams before resubmitting.

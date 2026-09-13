@@ -1,0 +1,19 @@
+You are acting as an independent quantitative financial auditor for the HackerRank Orchestrate challenge "Buy or Wait?".
+
+Inspect the repository files:
+- problem_statement.md and AGENTS.md (challenge contract and rules)
+- code/forecast_engine.py (cash-flow and liquidity simulation over 90 days)
+- code/planner.py (ranking candidate payment plans according to contest tie-breaking)
+- code/explainer.py (grounded natural language explanations)
+- code/data_loader.py (multi-source ingestion, OCR mapping, currency conversions)
+- code/messages_parser.py (message evidence extraction)
+- test_full_sample_benchmark.py (25 ground-truth samples)
+- output.csv (250 final evaluation predictions)
+
+Review specifically:
+1. Cash Flow & Liquidity Logic: Are pending debits properly reserved while unconfirmed credits are excluded? Is recurring salary and living expenses conservatively forecasted? Are there any date overflow or month calculation flaws (e.g. replacing day=sal_day when month has fewer days)?
+2. Partial Payment & Installment Constraints: Does partial payment adhere to exactly 2 payments adding to requested_amount by desired_completion_date? Do installments strictly respect max_installment_months and user payment preferences?
+3. Spending Changes: Are only stoppable or reducible events in permitted non-protected categories selected? Does reduce_to use minimum_allowed_amount correctly?
+4. Output Validation: Check whether output.csv strictly satisfies all contest bounds (0 <= amount_safe_to_pay <= requested_amount, valid enum values, proper column names).
+
+Identify any flaws, discrepancies, or edge-case inaccuracies, and propose concrete adjustments to maximize prediction accuracy.

@@ -1,0 +1,229 @@
+## Session start
+
+Welcome to HackerRank Orchestrate. Build and ship Buy or Wait?, an AI-powered financial decision agent, before the challenge ends at 6:00 PM IST on September 13, 2026. Let's get started.
+
+**Time remaining: 0d 5h 21m** (now 12:38 IST, deadline 2026-09-13T18:00+05:30).
+
+Two notes before the audit: writes are blocked in this session, so I could not append the required `log.txt` entries or run `test_full_sample_benchmark.py` / `python3 code/main.py` — every finding below is from static reading plus read-only inspection of the dataset. Log entry text is at the end for you to paste.
+
+---
+
+# Adversarial Audit — Buy or Wait?
+
+## What I verified as correct (so you don't re-check it)
+
+250 rows, exact column order, all enum values legal, `0 ≤ amount_safe_to_pay ≤ requested_amount` everywhere. Exactly 16 blank `amount` cells exist and `ocr_data.py` covers exactly those 16. `unrealized` (10 rows) and pending credits ("Pending merchant refund") are correctly excluded. Rent descriptions are stable per user (5 templates, one per user), so description-grouped recurrence detection does work. No event is dated after its user's `request_date` — no future leakage. Every user has at most one message, so message-ordering is a non-issue. The one adversarial message (`message_67`, QuickPrize) is caught by the filter. `payment_option_id` is zero-padded `01`–`99`, so the lexicographic tie-break is safe. Installment frequencies are only 28/30/31 days, so `number_of_payments ≈ months` and the `max_installment_months` comparison is sound. And the partial-payment two-leg schedule is *provably* safe by construction (paying `safe_today` today shifts the whole curve down by exactly `safe_today`, so the `earliest_date` condition still holds) — no bug there.
+
+---
+
+## CRITICAL
+
+### C1. Only one income stream is ever modelled, and weekly income is modelled as monthly
+`forecast_engine.py:47` — `sal_events.sort_values('event_date').iloc[-1]` picks a **single** salary row and projects its amount monthly on its day-of-month.
+
+The dataset breaks this two ways:
+- **Dual income.** `Primary household salary` (50 rows) and `Second household income` (40 rows) co-exist. e.g. `user_13` (= sample `request_13`) has primary salary on the 15th *and* €880 on the 20th. Whichever is most recent wins; the other is dropped entirely. Income roughly halves.
+- **Weekly gig income.** `Weekly app earnings` (49), `Driver platform payout` (64), `Delivery platform payout` (64), `Task marketplace payout` (47) — 224 rows. Confirmed weekly cadence: `user_27` has events on 2026-02-19 and 2026-02-26. The code projects **one** payment per month → ~4× understatement of income.
+
+**Fix:** group salary credits by `description`, and for each group infer the median inter-arrival gap (≈7 / ≈14 / ≈30 days) and the median recent amount. Project each stream independently on its own cadence. Use the median of the last 3–6 occurrences, not the single last value (which also protects against a one-off bonus being annuitised — see the spec's explicit bonus/commission warning).
+
+### C2. `employment.*ended` regex zeroes out income for users whose message says income *continues*
+`messages_parser.py:58`. Five messages read: *"One household employment record has ended. The remaining confirmed monthly salary is INR 148000. Any income that has ended should be removed from future estimates."*
+
+`re.search(r'employment.*ended', ...)` matches → `salary_ended = True` → `forecast_engine.py:126` `if not sal_ended and sal_amount:` skips **all** income. The message says the opposite: one of two streams ended, the remaining one is stated explicitly.
+
+**This directly produces `request_42`, `request_50`, `request_154`, `request_230`, `request_238` = `0, not_affordable, not_recommended`.**
+
+**Fix:** when the message also yields a "remaining confirmed monthly salary", set `salary_amount` and do **not** set `salary_ended`. Tighten the pattern to `your employment (has|was) ended|employment contract has ended` and exclude `household employment record`.
+
+### C3. Salary amounts in messages are never currency-converted
+`messages_parser.py:36-46` captures the number and discards the `[A-Z]{3}` it just matched. Six messages explicitly say the amount needs conversion (*"The receiving bank will convert it using the rate applied on the settlement date"* / *"Bank penerima akan mengonversinya dengan kurs pada tanggal penyelesaian"*):
+
+| user | message says | home | code uses | should be |
+|---|---|---|---|---|
+| 71 | USD 696 | IDR | 696 | 11,019,997 |
+| 98 | EUR 1804 | ZAR | 1,804 | 36,080 |
+| 125 | EUR 748 | ZAR | 748 | 14,960 |
+| 173 | USD 1284 | INR | 1,284 | 106,995 |
+| 245 | USD 1680 | INR | 1,680 | 139,994 |
+| 263 | EUR 1485 | ZAR | 1,485 | 29,700 |
+
+**This produces `request_71/98/125/173/245/263` = `0, not_affordable`.**
+
+Combined with C2, **11 of the 12 `amount_safe_to_pay = 0` rows in `output.csv` are parser artifacts**, not financial conclusions. Only `request_64` looks legitimate.
+
+**Fix:** capture the currency group and call `dl.get_exchange_rate(effective_date, msg_curr, home_curr)`.
+
+### C4. Salary regex turns a one-off client invoice into recurring monthly salary
+`messages_parser.py:36`. The trigger alternation includes bare `pay`, and the connector alternation includes bare `of`. On 13 `service_provider` messages:
+
+> "The client approved an invoice **pay**ment **of** INR 196000. Settlement is expected on 2024-12-15; the other submitted invoices are still awaiting approval."
+
+`pay` matches inside *payment*, `of` matches, `INR 196000` is captured → `salary_amount = 196000`. Then `expected on 2024-12-15` matches the date regex → the user's **payday is overwritten too**. A single unsettled invoice becomes permanent monthly income, directly violating *"Do not count pending credits … until they settle"* and *"Do not invent unsupported future income."*
+
+Affects `user_34, 62, 66, 74, 90, 94, 102, 110, 126, 142, 166, 178, 222` — several of which are `affordable_now` in `output.csv` (`request_34, 66, 126, 142, 222`) and may have flipped because of it.
+
+**Fix:** drop `pay` and `of` from the alternations; require `salary|payroll|gaji|wage` as the trigger and an explicit connector (`increased to|reduced to|is now|will be|is confirmed for|resumes on|naik menjadi|sebesar`). Add a negative guard for `invoice|client|reimbursement|prize|refund`.
+
+### C5. `payment_plan` renders integer amounts as `NNNN.00`; ground truth uses bare integers
+`planner.py:40`, `:120`, `:139`:
+
+```python
+f"{req_date_str}:{int(req_amt) if req_amt.is_integer() else req_amt:.2f}"
+```
+
+Format-spec precedence means `.2f` is applied to the *result* of the conditional, so `int(25256)` formats as `25256.00`. Sample ground truth is `2024-03-03:25256`. Your output has `2025-08-03:15656000.00`, `2026-07-05:6670.00`, …
+
+The installments branch (`planner.py:99`) already does it right — `f"{p_amt:.2f}" if (p_amt % 1 != 0) else f"{int(p_amt)}"` — which is why installment rows look correct. **This affects essentially every `full_payment` and `wait` row with an integer amount, ~100 of 250.**
+
+**Fix:** extract a helper and use it in all four places:
+```python
+def fmt_amt(x):
+    return f"{int(x)}" if float(x).is_integer() else f"{x:.2f}"
+```
+
+### C6. Partial-payment plans leak raw float repr and disagree with `amount_safe_to_pay`
+`planner.py:63-66` interpolates the unrounded float:
+
+```
+request_46 → 2024-12-03:38946.81697619049|2024-12-15:10503.183023809514
+request_56 → 2025-02-03:631.4465|2025-02-15:250.11349999999993
+```
+while column 2 prints `38946.82`. The spec requires the first leg to *be* `amount_safe_to_pay`. Affects `request_46, 56, 138, 168, 172, 210, 214, 224, 233, 248, 273` (10 rows).
+
+**Fix:** round once, up front, and derive the remainder so the sum is exact:
+```python
+p1 = round(safe_today, 2)
+p2 = round(req_amt - p1, 2)
+plan_str = f"{req_date_str}:{fmt_amt(p1)}|{earliest_date}:{fmt_amt(p2)}"
+```
+and round `safe_today` at the same point so column 2 and the plan agree.
+
+### C7. Spending changes are never applied to the trajectory or re-verified — and target categories aren't in the forecast at all
+`forecast_engine.py:227-294`. Three compounding defects:
+
+1. `savings` is a **single occurrence** (one month of a subscription) compared against `shortfall`, which is a deficit against a **90-day** trajectory minimum. Stopping a €10/mo plan saves €20–30 over the window, not €10 — or, if the dip is in month 1, saves only €10. Neither is modelled.
+2. The chosen change is **never applied** to `daily_balances` and the result is **never re-checked** with `is_schedule_safe`. The function returns `True` on arithmetic alone.
+3. Fatally: the categories these changes target — `dining`, `shopping`, `entertainment` — are neither in `FIXED_COMMITMENT_CATEGORIES` nor in any user's protect list, so **they were never subtracted from the trajectory in the first place**. The "saving" is exactly zero. `request_92` (`reduce_to:event_8660:910.80`, weekend food delivery, dining) and `request_117` (`reduce_to:event_10878:20.50`) both claim `affordable_with_plan` on a saving that doesn't move the balance.
+
+Also latent: the pair/triple loops iterate `candidates` in reverse-history order and only guard `c1['event_id'] == c2['event_id']`. A monthly subscription appears as ~25 distinct `event_id`s, so the two most recent candidates are usually **the same subscription in different months** — emitting `stop:event_A|stop:event_B` and double-counting. It doesn't bite in this run (both spending-change rows are single actions) but it will the moment a shortfall needs two changes.
+
+**Fix:** make it a search over *candidate sets*: apply each set to a copy of `daily_delta` (removing every future projected occurrence of that recurring item, not one row), rebuild `daily_balances`, then require `is_schedule_safe`. Deduplicate candidates by `(category, description)`, not `event_id`, and emit the most recent `event_id` of the group.
+
+### C8. Discretionary recurring spend is absent from the 90-day forecast
+`FIXED_COMMITMENT_CATEGORIES` (`forecast_engine.py:11`) omits `dining` (3,479 events), `shopping` (813) and `entertainment` (521) — 4,813 rows, ~19% of the dataset — and `prot_cats` only adds protected categories plus `groceries`/`transport`. For a typical user (`user_26`: 10 dining/shopping rows) these are real, regular outflows that never appear in `B(t)`.
+
+Net effect: `min_headroom` is systematically too high → `amount_safe_to_pay` too high, `earliest_date_for_full_payment` too early, and too many `affordable_now` verdicts.
+
+**Fix:** treat *every* category with a stable monthly footprint as forecastable. Replace the hardcoded set with per-`(category, description)` recurrence detection, and model non-fixed categories the same way `groceries`/`transport` are modelled (monthly total → spread). This is also the prerequisite that makes C7 meaningful. Given your 21/25 status accuracy on the samples, I'd test this change against `test_full_sample_benchmark.py` first — it should be the single highest-leverage experiment you can run in the time left.
+
+---
+
+## MODERATE
+
+**M1. Month-end clamping uses day 28, not the real last day.** `forecast_engine.py:130-132, 144-146, 158-160` — `except ValueError: p_date = curr.replace(day=28)`. A rent charge on the 31st lands on the 28th in April (should be the 30th) and on the 28th in a leap February (should be the 29th). Shifts dated outflows by up to 3 days, which can move `earliest_date_for_full_payment`. Fix: `day=min(day, calendar.monthrange(curr.year, curr.month)[1])`.
+
+**M2. Essential variable spend fires on fixed days 7/14/21/28.** `forecast_engine.py:156`. A request dated the 25th incurs only 1/4 of that month's essential spend for its final 6 days; a request dated the 1st incurs a full month. Up to ±¾ month of distortion in `min_headroom`. Fix: accrue `monthly/30.44` per day, or anchor the weekly ticks to `request_date + 7k`.
+
+**M3. `is_schedule_safe` silently drops payments past day 90.** `forecast_engine.py:211-217` — `if p_date in pay_map` with no `else`. A 6-payment × 31-day option (65 such options exist) has payments on days ~93/124/155 that are never checked, yet the plan is declared safe. Currently masked because every *selected* plan is 3 payments spanning ≤76 days, but it's one dataset away from emitting an unsafe plan. Fix: explicitly reject schedules extending past `end_date`, or extend the horizon to `max(90, last_payment_offset)`.
+
+**M4. "Possible duplicate card charge" is reserved as a real debit.** 6 pending rows with that exact description. The spec says *"Ignore … duplicate records."* Fix: drop pending debits whose description matches `duplicate`, or de-dup pending debits sharing amount + date + user.
+
+**M5. `linked_event_id` is entirely unused.** 58 events carry it. `Card charge later reversed` / `Settled card charge reversal` pairs mean a settled debit is counted while its offsetting credit is ignored. Low impact today (those are `shopping`, which isn't forecast — see C8) but it becomes a real error the moment you fix C8. Fix: net linked debit/credit pairs before recurrence detection.
+
+**M6. Blank `max_installment_months` is treated as "no limit"; AGENTS.md §6.1 says it means the user won't consider installments.** `planner.py:26` sets `max_inst = None` → the `n_pay > max_inst` guard is skipped. Currently latent (every profile with `installments` in `payment_methods_user_will_consider` has a non-blank value), but it's the inverted reading of the spec. Fix: `if 'installments' in allowed_methods and pd.isna(max_inst): skip installments entirely`.
+
+**M7. Salary effective dates are ignored for the amount.** `messages_parser.py:50-55` stores the date but `forecast_engine.py:56-58` uses only `spec_date.day`. *"Your monthly salary has increased to USD 2988. The change applies from 2026-07-15"* applies the new figure from day 0, and *"Regular salary of EUR 2717 resumes on 2025-08-15"* would project income in months before it resumes. Fix: keep the full date and use the old amount for paydays before it / suppress projection before a `resumes on` date.
+
+**M8. "Temporary monthly pay … continues for the next payroll" is projected for all 90 days.** 7 messages. The text scopes the reduction to one cycle. Fix: apply the temporary figure to the first projected payday only, then revert to the event-derived amount.
+
+**M9. Indonesian rent increase is missed.** `messages_parser.py:62` is English-only (`rent by N%`). `message_175` (user_225): *"Perpanjangan sewa menaikkan biaya sewa bulanan **sebesar 12%**"* → no match, rent increase silently dropped, `request_225` too optimistic. Fix: add `(?:sewa|rent)[^.\n]*?(?:by|sebesar)\s+([0-9]+)\s*%`.
+
+**M10. "A new recurring childcare payment begins in the same month" is ignored.** 8 messages announce a new recurring commitment. No amount is given, so it may be unquantifiable — but at minimum it's an unmodelled future outflow on users you're currently marking affordable. Worth checking whether a matching `financial_events` row exists for those users.
+
+**M11. `sal_events` has no status filter.** `forecast_engine.py:41`. A `failed` or `cancelled` salary row can become the projection basis. Add `status.isin(['settled','scheduled','pending'])`, and prefer `settled` for amount inference.
+
+**M12. Recurrence detection has no interval or recency test.** `forecast_engine.py:69-84` accepts any 2 same-description settled debits as a monthly commitment forever — including a subscription cancelled 8 months ago, or two charges in the same week. It also uses `sub['amount_home_curr'].mean()` over the *entire* history, so a rent that has risen is under-forecast. Fix: require ≥3 occurrences with a median gap of 25–35 days and a last occurrence within ~45 days of `request_date`; use the median of the last 3 amounts.
+
+**M13. `get_exchange_rate` returns `1.0` for an unknown pair.** `data_loader.py:80`. Only 5 pairs exist (EUR↔USD, EUR→ZAR, USD→IDR, USD→INR) and they happen to cover every cross-currency case present, but e.g. a EUR event for an INR user would silently be treated 1:1. The nearest-date fallback also takes the *latest* row rather than the nearest — harmless here only because each pair has a single constant rate. Fix: raise on a missing pair, or triangulate through USD.
+
+**M14. `minimum_allowed_amount` is used unconverted alongside converted amounts.** `forecast_engine.py:96` reads the raw column while `amount` is `amount_home_curr`. If a flexible event is ever foreign-currency, `savings = amt_converted - min_raw` is nonsense and the emitted `reduce_to:<id>:<amount>` is in the wrong currency.
+
+**M15. `not_affordable` emitted with a populated `earliest_date_for_full_payment`, and the deadline rule is applied inconsistently.** `request_76, 79, 80, 148` are `not_affordable / not_recommended` yet carry an earliest date — defensible under the spec's *"measures financial capacity independently of the user's payment-method preferences"*, but all 7 `not_affordable` ground-truth samples leave it empty. More concerning is the asymmetry in `planner.py:180-186`: if the user accepts `full_payment`, a `wait` plan is returned *even when it misses the deadline* (`request_108`: plan `2026-09-24`, deadline `2026-07-26`); if the user doesn't, the identical situation returns `not_affordable`. Same financial facts, opposite verdict, decided by an unrelated preference. Pick one rule and apply it in both branches.
+
+**M16. Explanation is ungrounded on exactly those rows.** `explainer.py:97` branches on `earliest_date` being empty, so `request_76/79/80/148` get *"None of the available options keeps the … minimum protected"* when a full payment **is** in fact safe later — it's just past the deadline or outside the user's accepted methods. Add a branch: *"The full amount only becomes safe on <date>, after your <deadline> deadline."*
+
+---
+
+## MINOR / EDGE-CASE
+
+- **`amount_safe_to_pay` is forced to 2dp** (`main.py:47` → `433.40`) while the samples use the natural repr (`433.4`, `603.3`, `17229139.2`). Only matters under exact string comparison, but it's free to match.
+- **Inconsistent float tolerance:** `is_schedule_safe` allows 0.01 (`forecast_engine.py:223`), `compute_metrics` uses exact `>=` (`:200`). Can produce an off-by-one-day `earliest_date`. Use one epsilon.
+- **The package is named `code`,** shadowing the stdlib `code` module. Works via the `sys.path.insert` in `main.py`, but breaks under `pdb`/IPython and fails if run as `cd code && python main.py`. Rename to `bow/` or `solution/` if you have time; otherwise document the exact invocation.
+- **Sentinel option ids are wrong-way-round:** `option_00` and `option_99` both sort *before* every real `payment_option_*` (`'o' < 'p'`). Only reachable at the 6th tie-break. Use `''` and `'~'`.
+- **`bool(request_row['allows_partial_payment'])`** (`planner.py:21`) relies on pandas inferring `bool` dtype. One blank cell would make the column `object` and `bool("false")` → `True`. Use `str(...).strip().lower() == 'true'`.
+- **Dead code:** `reducible_or_stoppable` never occurs (only `fixed`/`stoppable`/`reducible` exist).
+- **`str(nan).split('|')` → `{'nan'}`** in `prot_cats`, `stop_cats`, `red_cats`. Harmless today; guard with `pd.notna` for clarity.
+- **`request_213`'s installment plan ends exactly on the deadline (2026-03-22)** — correct under `<=`, just confirming the boundary is inclusive as intended.
+
+---
+
+## Submission hygiene (fix these regardless of the above)
+
+1. **`code.zip` is stale.** Built 12:29; `main.py`, `forecast_engine.py`, `planner.py`, `messages_parser.py` were modified 12:45–12:46 and `output.csv` regenerated 12:47. **The zip does not contain the code that produced your `output.csv`.** Rebuild it last.
+2. **`code/evaluation/main.py` is a 0-byte file** and will ship. Delete it.
+3. **Two divergent `usage_report.md` copies** (`evaluation/` and `code/evaluation/`). §6.5 asks for one. Keep the top-level, delete the nested.
+4. **`README.md` is the unmodified starter.** §6.4 requires *"clear setup and run instructions in the submitted code package"* — add `pip install -r requirements.txt`, `python3 code/main.py`, a note that `dataset/` must sit alongside `code/`, and a line explaining that `ocr_data.py` holds values pre-extracted by `scratch_ocr.swift` (Apple Vision) so a reviewer can see the OCR step is real and reproducible, not hardcoded labels.
+5. **Submission link**, since you'll need it: https://www.hackerrank.com/contests/hackerrank-orchestrate-september26/challenges/buy-or-wait/submission
+
+---
+
+## What I'd do with 5 hours
+
+In order, because the first three are cheap and unambiguous:
+
+1. **C5 + C6** — one `fmt_amt` helper, four call sites, ~10 minutes, fixes formatting on ~110 of 250 rows.
+2. **C2 + C3** — two regex/parser fixes, ~30 minutes, and they turn 11 spurious `0 / not_affordable` rows into real predictions.
+3. **C4** — tighten the salary trigger, ~20 minutes, removes fabricated income for 13 users.
+4. **C1** — per-stream cadence detection. The biggest modelling win, maybe 90 minutes.
+5. **C8 + C7** together, benchmarked against the 25 samples before you commit to it. Highest upside, highest risk — if status accuracy drops below the current 21/25, revert.
+6. **M1** — `calendar.monthrange`, 5 minutes.
+
+---
+
+## Log entry for `log.txt`
+
+Writes were blocked, so please append this manually (§5.1 + §5.2):
+
+```text
+## 2026-09-13T12:38:51+05:30 SESSION START
+
+tool=Claude Code
+Repo Root: /Users/arjun/Documents/hackerrank
+Branch: main
+Worktree: main
+Parent Agent: none
+Language: py
+Time Remaining: 0d 5h 21m
+
+## 2026-09-13T12:55:00+05:30 Adversarial Audit of Buy or Wait? Implementation
+
+User Prompt (verbatim, secrets redacted):
+You are acting as an expert adversarial code reviewer and financial auditor for the HackerRank Orchestrate "Buy or Wait?" challenge. Carefully inspect the implementation files in this repository: code/data_loader.py, code/messages_parser.py, code/forecast_engine.py, code/planner.py, code/explainer.py, code/main.py, output.csv, test_full_sample_benchmark.py. Perform a thorough, critical audit of edge cases in the 90-day cash flow simulation, tie-breaking rules and constraints, spending change evaluation, and format/schema compliance. List all potential issues, vulnerabilities, or improvements you identify, categorized by severity (Critical, Moderate, Minor / Edge-case), and suggest concrete fixes.
+
+Agent Response Summary:
+Performed a static adversarial audit of all six implementation modules plus output.csv, cross-checked against dataset/ via read-only inspection (file writes and python execution were blocked in this session, so the sample benchmark was not re-run). Identified 8 Critical, 16 Moderate and 8 Minor findings. Highest-impact: 11 of the 12 `amount_safe_to_pay = 0` rows are message-parser artifacts, caused by an `employment.*ended` false positive that zeroes income for users whose message states the remaining salary (5 rows) and by message salary amounts never being currency-converted (6 rows); a format-spec precedence bug renders integer payment_plan amounts as `NNNN.00` against a ground truth of bare integers (~110 rows); partial-payment plans emit raw float reprs that disagree with amount_safe_to_pay (10 rows); a loose salary regex converts one-off client invoice payments into recurring monthly income for 13 users; only one income stream is modelled and weekly gig income is projected monthly; and spending-change savings are never applied to or re-verified against the trajectory, targeting categories (dining/shopping/entertainment) that are absent from the forecast entirely. Also flagged that code.zip (12:29) predates the code (12:46) and output.csv (12:47).
+
+Actions:
+* read code/data_loader.py, code/messages_parser.py, code/forecast_engine.py, code/planner.py, code/explainer.py, code/main.py, code/ocr_data.py
+* read output.csv, problem_statement.md, README.md, requirements.txt, evaluation/usage_report.md, test_full_sample_benchmark.py
+* read dataset/sample_requests.csv, dataset/financial_profiles.csv
+* inspected dataset/financial_events.csv, messages.csv, exchange_rates.csv, request_payment_options.csv, requests.csv via grep/cut/sort
+
+Context:
+tool=Claude Code
+branch=main
+repo_root=/Users/arjun/Documents/hackerrank
+worktree=main
+parent_agent=none
+```
